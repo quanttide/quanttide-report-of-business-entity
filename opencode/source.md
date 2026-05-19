@@ -3,6 +3,8 @@
 > 分析日期: 2026-05-20
 > 分析范围: packages/opencode/src/agent/, packages/opencode/src/session/prompt.ts
 > 测试覆盖: packages/opencode/test/
+> 分析方法: 静态代码阅读（高置信度）+ 逻辑推导（中置信度）
+> 用户反馈: 未验证，标注为"推测"
 
 ---
 
@@ -52,10 +54,9 @@ while (true) {
 | **无重试机制** | L1821 `handle.process` | 🔴 高 | LLM 调用失败直接终止，无 exponential backoff |
 | **无工具超时** | L578-608 `resolveTools` | 🔴 高 | 工具（如 bash）可无限期阻塞循环 |
 | **无死循环检测** | L1770-1832 | 🔴 高 | LLM 反复调用同一工具不会被阻止 |
-| **无并发控制** | L1821 `handle.process` | 🟡 中 | LLM 返回 10 个工具调用会全部并行执行 |
 | **全量读消息** | L1655 | 🟡 中 | 每轮循环从数据库读全部消息，长会话性能差 |
 | **step 计数不持久化** | L1648 `let step = 0` | 🟡 中 | 进程重启后 maxSteps 限制失效 |
-| **同步阻塞压缩** | L1699-1707 | 🟡 中 | compaction.process 阻塞循环，用户无进度反馈 |
+| **同步阻塞压缩** | L1699-1707 | 🟡 中 | compaction.process 阻塞循环，用户无进度反馈。前提：假设 compaction 只有同步模式（需确认）。若支持异步，此缺陷不成立 |
 | **硬编码退出条件** | L1672-1678 | 🟢 低 | `["tool-calls"]` 应使用常量/枚举 |
 
 ### 2.4 退出条件分析
@@ -78,7 +79,14 @@ if (
 
 ## 3. 漂移问题 (Drift)
 
-### 3.1 根因分析
+### 3.1 用户感知（推测，未验证）
+
+- "卡手"：越用越慢，突然卡住 — 可能原因：compaction 阻塞、全量读消息
+- "漂移"：Agent 忘记最初要做什么，反复做同一件事 — 可能原因：Attention 衰减
+
+以上描述来自代码分析推导，未收集实际用户反馈验证。
+
+### 3.2 根因分析
 
 | 原因 | 代码位置 | 机制 |
 |------|----------|------|
@@ -88,23 +96,32 @@ if (
 | **无计划跟踪** | 全局缺失 | 没有 TODO list 跟踪进度 |
 | **无工作记忆** | 全局缺失 | 不维护已发现事实、已做决策 |
 
-### 3.2 用户体验表现
-
-- "卡手"：越用越慢，突然卡住（压缩阻塞）
-- "漂移"：Agent 忘记最初要做什么，反复做同一件事
-
 ### 3.3 推荐改进方案
 
-| 方案 | Token 开销 | 进度追踪 | 漂移检测 | 复杂度 |
-|------|-----------|---------|---------|--------|
-| 原始任务锚点 | 高 | ❌ | ❌ | 低 |
-| **任务状态机** | 中 | ✅ | ⚠️ | 中 |
-| 分层执行 | 低 | ✅ | ✅ | 高 |
-| 工作记忆 | 极低 | ✅ | ✅ | 高 |
-| 自反思循环 | 额外调用 | ✅ | ✅ | 中 |
-| **约束持久化** | 低 | ❌ | ✅ | 低 |
+| 方案 | Token 开销 | 进度追踪 | 漂移检测 | 复杂度 | 建议排期 |
+|------|-----------|---------|---------|--------|---------|
+| 原始任务锚点 | 高 | ❌ | ❌ | 低 | P0（~10 行，不改逻辑，零风险） |
+| **任务状态机** | 中 | ✅ | ⚠️ | 中 | P1（需新增 interface + 序列化 + 存储） |
+| 分层执行 | 低 | ✅ | ✅ | 高 | P2 |
+| 工作记忆 | 极低 | ✅ | ✅ | 高 | P2 |
+| 自反思循环 | 额外调用 | ✅ | ✅ | 中 | P1 |
+| **约束持久化** | 低 | ❌ | ✅ | 低 | P1 |
 
 **推荐组合**: 任务状态机 + 约束持久化 + 每 5 轮自反思
+
+**优先级排序理由**：
+
+```
+P0（原始任务锚点）优先：
+- 改动量约 10 行，system prompt 加一条消息，不影响任何逻辑
+- 无风险，可立即上线观察效果
+
+P1（任务状态机 + 自反思 + 约束持久化）延后：
+- 三项均需新增数据结构和序列化逻辑
+- 任务状态机依赖先确认 task/original 的存储位置
+- 约束持久化需要先定义"约束"的提取规则
+- 自反思需要先有漂移的判定标准
+```
 
 ---
 
@@ -208,31 +225,44 @@ session/prompt/
 | 工具超时 | ❌ | ✅ | ✅ | ✅ |
 | 死循环检测 | ❌ | ✅ | ⚠️ | ✅ |
 | 重试机制 | ❌ | ✅ | ✅ | ✅ |
-| 并发控制 | ❌ | ✅ | ✅ | ✅ |
+| 并发控制 | ✅（并行） | ✅（并行） | ✅（并行） | ✅（并行） |
 | 任务状态跟踪 | ❌ | ✅ | ❌ | ✅ |
 
 ---
 
-## 7. 优先改进建议
+## 7. 改进建议
 
-### 7.1 最小改动（3 个）
+### 7.1 高优先级（P0）
 
-1. **加原始任务锚点**: system prompt 始终包含第一条用户消息
-2. **加工具超时**: `Effect.timeout(item.execute(...), "30 seconds")`
-3. **加死循环检测**: 记录最近 5 次工具调用，3 次相同强制 break
+**加原始任务锚点**
+system prompt 始终包含第一条用户消息，约 10 行改动，不改变现有逻辑。
 
-### 7.2 中期改进
+**加工具超时**
+```typescript
+Effect.timeout(item.execute(...), "30 seconds")
+```
+约 3 行改动，防止 shell 命令无限阻塞。
 
-4. **任务状态机**: 维护 Goal/Progress/Completed/Constraints
-5. **约束持久化**: 不可变约束单独提取，每轮强制注入
-6. **增量消息读取**: 只读新消息，缓存历史
+**加死循环检测**
+记录最近 5 次工具调用，3 次相同时强制 break。约 15 行改动。
 
-### 7.3 长期改进
+### 7.2 中优先级（P1）
 
-7. **分层执行**: 原始任务 → 子任务 → 工具调用
-8. **工作记忆**: 维护 facts/decisions/openQuestions
-9. **自反思循环**: 每 5 轮检查是否偏离目标
-10. **拆分 prompt.ts**: 按职责拆分为多个文件
+**任务状态机**
+新增 `TaskState` 接口，存储 original/current/completed/constraints，每轮以结构化数据注入。
+
+**约束持久化**
+从原始任务中提取不可变约束，每轮强制注入 system prompt。
+
+**自反思循环**
+每 5 轮执行一次元认知检查，判断是否偏离目标。
+
+### 7.3 长期（P2）
+
+- 分层执行：原始任务 → 子任务 → 工具调用
+- 工作记忆：维护 facts/decisions/openQuestions
+- 增量消息读取：只读新消息，缓存历史
+- 拆分 prompt.ts
 
 ---
 
@@ -250,146 +280,3 @@ session/prompt/
 | LLM 调用 | `src/session/prompt.ts` | 1821-1832 |
 | Agent 测试 | `test/agent/agent.test.ts` | 732 行 |
 | Prompt 测试 | `test/session/prompt.test.ts` | 1528+ 行 |
-
----
-
-# 漂移问题专项分析
-
-## 症状
-
-- Agent 执行过程中"忘记"最初要做什么
-- 反复做同一件事（原地打转）
-- 压缩上下文后开始偏离约束
-
-## 根因
-
-### 1. Attention 机制的位置效应
-
-```
-[系统提示] ← 高权重
-[早期对话] ← 权重随距离衰减
-[中间对话] ← 最低权重（"中间迷失"现象）
-[最近对话] ← 高权重（recency bias）
-```
-
-随着对话变长，原始指令被推到中间区域，注意力权重最低。
-
-### 2. 代码层面的缺失
-
-| 机制 | 现状 | 代码位置 |
-|------|------|----------|
-| 原始任务锚点 | ❌ 不存在 | `runLoop` 只看 `lastUser` |
-| 任务状态跟踪 | ❌ 不存在 | 无 Goal/Progress 结构 |
-| 死循环检测 | ❌ 不存在 | 无 tool call 去重 |
-| 约束持久化 | ❌ 不存在 | 压缩后约束丢失 |
-| 计划跟踪 | ❌ 不存在 | 无 TODO list |
-
-### 3. 上下文压缩的副作用
-
-```typescript
-// L1655
-let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
-// 压缩后的消息变成摘要，工具调用的具体结果被丢弃
-```
-
-压缩把 10 轮对话压缩成一段摘要，但摘要里可能丢失了关键约束（如"只改 src/ 目录"）。
-
-## 推荐方案
-
-### 方案 A: 任务状态机（推荐优先实现）
-
-```typescript
-interface TaskState {
-  original: string      // 原始意图
-  current: string       // 当前子目标
-  completed: string[]   // 已完成的步骤
-  constraints: string[] // 不可变的约束
-  modified: boolean     // 用户是否修改过目标
-}
-```
-
-每轮注入结构化状态而非原始文本：
-
-```
-System Prompt:
-## Task State
-Goal: 找 API 端点并写文档
-Progress: 3/5 steps completed
-Completed: [grep api, read users.ts, read posts.ts]
-Next: write API_DOCS.md
-Constraints: 只改 src/ 目录
-```
-
-**优势**:
-- Token 少（只传结构化数据）
-- 有进度跟踪
-- 约束与目标分离
-- 用户修改目标时只更新 `current`
-
-### 方案 B: 约束持久化
-
-把不可变约束单独提取，每轮强制注入：
-
-```typescript
-const constraints = extractConstraints(originalTask)
-// "只改 src/" → { type: "path", pattern: "src/**", action: "allow" }
-
-// 每轮注入：
-system.push(`<constraints>${constraints.map(c => c.toXml()).join('\n')}</constraints>`)
-```
-
-### 方案 C: 自反思循环
-
-每 N 轮执行一次元认知检查：
-
-```typescript
-const reflection = yield* llm.stream({
-  system: `Check if the agent is still on track.`,
-  messages: [
-    { role: "user", content: `Original task: "${originalTask}"` },
-    { role: "assistant", content: `Recent actions: ${recentActions}` },
-  ]
-})
-
-if (reflection.drift) {
-  msgs.push({
-    role: "system",
-    content: `You have drifted. Refocus on: ${originalTask}`
-  })
-}
-```
-
-## 测试建议
-
-```typescript
-it.instance("agent stays on track after 10 tool calls", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const chat = yield* sessions.create({
-      permission: [{ permission: "*", action: "allow", pattern: "*" }]
-    })
-
-    // 预设 10 轮工具调用
-    for (let i = 0; i < 10; i++) {
-      yield* llm.tool("read", { file: `file${i}.ts` })
-    }
-    yield* llm.text("All files read. Original task: write docs for API endpoints")
-
-    const result = yield* prompt.loop({ sessionID: chat.id })
-
-    // 断言：最终回复包含原始任务关键词
-    const text = result.parts.find(p => p.type === "text")?.text ?? ""
-    expect(text).toContain("API")  // 漂移检测
-  }),
-)
-```
-
-## 实施优先级
-
-1. **P0**: 加原始任务锚点（最小改动，立即见效）
-2. **P0**: 加工具超时（解决"卡手"问题）
-3. **P1**: 加死循环检测（防止原地打转）
-4. **P1**: 任务状态机（结构化进度跟踪）
-5. **P2**: 约束持久化（压缩后保留约束）
-6. **P2**: 自反思循环（主动检测漂移）
