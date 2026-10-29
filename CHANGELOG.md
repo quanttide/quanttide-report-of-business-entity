@@ -1,0 +1,1 @@
+- 移除 qtrecurit 招聘报告与 qtrecurit-report 生成技能：迁移至量潮创新联盟报告仓（quanttide-report-of-innovation-alliance）
