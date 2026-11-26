@@ -1,1 +1,2 @@
+- qtclass 补两日社群记录：vibe-coding.md 并入 11-25 冷启动日（作品页两条路线、署名未决、托管与发行分叉），index 上提冷启动淘汰规则与成果公开池两条跨课程判断，第六节补 11-26 两条素材直链
 - 移除 qtrecurit 招聘报告与 qtrecurit-report 生成技能：迁移至量潮创新联盟报告仓（quanttide-report-of-innovation-alliance）
